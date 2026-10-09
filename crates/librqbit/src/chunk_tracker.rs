@@ -286,6 +286,31 @@ impl ChunkTracker {
         }
     }
 
+    pub fn forget_piece(&mut self, idx: ValidPieceIndex, file_infos: &FileInfos) -> bool {
+        let id = idx.get() as usize;
+        if !self.have.as_slice()[id] {
+            return false;
+        }
+        self.have.as_slice_mut().set(id, false);
+        if let Some(s) = self.chunk_status.get_mut(self.lengths.chunk_range(idx)) {
+            s.fill(false);
+        }
+        let len = self.lengths.piece_length(idx) as u64;
+        self.hns.have_bytes -= len;
+        if self.selected[id] {
+            self.hns.needed_bytes += len;
+        }
+        for (file_id, fi) in file_infos.iter().enumerate() {
+            if fi.piece_range.contains(&idx.get()) {
+                let in_file =
+                    self.lengths
+                        .size_of_piece_in_file(idx.get(), fi.offset_in_torrent, fi.len);
+                self.per_file_bytes[file_id] = self.per_file_bytes[file_id].saturating_sub(in_file);
+            }
+        }
+        true
+    }
+
     pub fn is_chunk_ready_to_upload(&self, chunk: &ChunkInfo) -> bool {
         self.have
             .as_slice()
@@ -712,5 +737,50 @@ mod tests {
             !ct.queue_pieces[0],
             "a piece we have is still queued, so a second peer will download it again"
         );
+    }
+
+    #[test]
+    fn test_a_forgotten_piece_is_neither_had_nor_queued() {
+        let piece_len = CHUNK_SIZE * 2;
+        let l = Lengths::new(piece_len as u64 * 3, piece_len).unwrap();
+        let files = vec![FileInfo {
+            relative_filename: "0".into(),
+            offset_in_torrent: 0,
+            piece_range: 0..3,
+            len: piece_len as u64 * 3,
+            attrs: Default::default(),
+        }];
+        let bf_len = l.piece_bitfield_bytes();
+        let have = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
+        let mut selected = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
+        selected.get_mut(0..3).unwrap().fill(true);
+        let mut ct = ChunkTracker::new(have.into_dyn(), selected, l, &files).unwrap();
+        let p1 = l.validate_piece_index(1).unwrap();
+        let before = *ct.get_hns();
+
+        ct.reserve_needed_piece(p1);
+        ct.chunk_status
+            .get_mut(l.chunk_range(p1))
+            .unwrap()
+            .fill(true);
+        ct.mark_piece_downloaded(p1);
+        ct.update_file_have_on_piece_completed(p1, 0, &files[0]);
+        assert_eq!(ct.per_file_have_bytes()[0], piece_len as u64);
+
+        assert!(ct.forget_piece(p1, &files));
+        assert!(!ct.is_piece_have(p1));
+        assert!(
+            !ct.queue_pieces[1],
+            "a forgotten piece is fetched only when streamed"
+        );
+        assert!(!ct.chunk_status.get(l.chunk_range(p1)).unwrap().any());
+        assert_eq!(ct.per_file_have_bytes()[0], 0);
+        assert_eq!(*ct.get_hns(), before);
+        assert_eq!(ct.calc_hns(), before);
+        assert!(
+            !ct.forget_piece(p1, &files),
+            "forgetting twice changes nothing"
+        );
+        assert_eq!(*ct.get_hns(), before);
     }
 }

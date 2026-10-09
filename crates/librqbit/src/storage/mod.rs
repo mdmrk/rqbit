@@ -36,7 +36,7 @@ use std::{
     path::Path,
 };
 
-use librqbit_core::lengths::ValidPieceIndex;
+pub use librqbit_core::lengths::{Lengths, ValidPieceIndex};
 
 use crate::torrent_state::{ManagedTorrentShared, TorrentMetadata};
 
@@ -177,6 +177,10 @@ pub trait TorrentStorage: Send + Sync {
     fn on_piece_completed(&self, _piece_index: ValidPieceIndex) -> anyhow::Result<()> {
         Ok(())
     }
+
+    fn discard_piece(&self, _piece_index: ValidPieceIndex) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
@@ -223,6 +227,10 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
 
     fn on_piece_completed(&self, piece_id: ValidPieceIndex) -> anyhow::Result<()> {
         (**self).on_piece_completed(piece_id)
+    }
+
+    fn discard_piece(&self, piece_id: ValidPieceIndex) -> anyhow::Result<()> {
+        (**self).discard_piece(piece_id)
     }
 }
 

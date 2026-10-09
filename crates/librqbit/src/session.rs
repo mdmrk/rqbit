@@ -298,6 +298,9 @@ pub struct AddTorrentOptions {
 
     // Custom trackers
     pub trackers: Option<Vec<String>>,
+
+    #[serde(default)]
+    pub stream_window: Option<u64>,
 }
 
 pub struct ListOnlyResponse {
@@ -1369,6 +1372,7 @@ impl Session {
                     ratelimits: opts.ratelimits,
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
+                    stream_window: opts.stream_window,
                     #[cfg(feature = "disable-upload")]
                     _disable_upload: self._disable_upload,
                 },

@@ -41,9 +41,17 @@ impl StreamState {
         lengths.compute_current_piece(self.position, self.file_abs_offset)
     }
 
-    fn queue<'a>(&self, lengths: &'a Lengths) -> impl Iterator<Item = ValidPieceIndex> + use<'a> {
+    fn span(&self, lookahead: u64) -> std::ops::Range<u64> {
         let start = self.file_abs_offset + self.position;
-        let end = (start + PER_STREAM_BUF_DEFAULT).min(self.file_abs_offset + self.file_len);
+        start..(start + lookahead).min(self.file_abs_offset + self.file_len)
+    }
+
+    fn queue<'a>(
+        &self,
+        lengths: &'a Lengths,
+        lookahead: u64,
+    ) -> impl Iterator<Item = ValidPieceIndex> + use<'a> {
+        let std::ops::Range { start, end } = self.span(lookahead);
         let dpl = lengths.default_piece_length();
         let start_id = (start / dpl as u64).try_into().unwrap();
         let end_id = end.div_ceil(dpl as u64).try_into().unwrap();
@@ -51,13 +59,81 @@ impl StreamState {
     }
 }
 
-#[derive(Default)]
 pub(crate) struct TorrentStreams {
     next_stream_id: AtomicUsize,
     streams: DashMap<StreamId, StreamState>,
+    lookahead: u64,
+    window: Option<u64>,
+}
+
+impl Default for TorrentStreams {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+pub(crate) fn pieces_to_forget(
+    have: impl Iterator<Item = ValidPieceIndex>,
+    lengths: &Lengths,
+    spans: &[std::ops::Range<u64>],
+    mut held: u64,
+    budget: u64,
+) -> Vec<ValidPieceIndex> {
+    if held <= budget || spans.is_empty() {
+        return Vec::new();
+    }
+    let mut candidates: Vec<(u64, ValidPieceIndex)> = have
+        .filter_map(|piece| {
+            let start = lengths.piece_offset(piece);
+            let end = start + lengths.piece_length(piece) as u64;
+            spans
+                .iter()
+                .map(|span| {
+                    if end <= span.start {
+                        Some(span.start - end)
+                    } else if start >= span.end.max(span.start + 1) {
+                        Some(start - span.end)
+                    } else {
+                        None
+                    }
+                })
+                .try_fold(u64::MAX, |nearest, d| Some(nearest.min(d?)))
+                .map(|distance| (distance, piece))
+        })
+        .collect();
+    candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(b.1.get().cmp(&a.1.get())));
+    let mut forget = Vec::new();
+    for (_, piece) in candidates {
+        if held <= budget {
+            break;
+        }
+        held -= lengths.piece_length(piece) as u64;
+        forget.push(piece);
+    }
+    forget
 }
 
 impl TorrentStreams {
+    pub(crate) fn new(window: Option<u64>) -> Self {
+        Self {
+            next_stream_id: AtomicUsize::new(0),
+            streams: DashMap::new(),
+            lookahead: window.map_or(PER_STREAM_BUF_DEFAULT, |w| w / 4 * 3),
+            window,
+        }
+    }
+
+    pub(crate) fn window(&self) -> Option<u64> {
+        self.window
+    }
+
+    pub(crate) fn spans(&self) -> Vec<std::ops::Range<u64>> {
+        self.streams
+            .iter()
+            .map(|s| s.value().span(self.lookahead))
+            .collect()
+    }
+
     fn next_id(&self) -> usize {
         self.next_stream_id.fetch_add(1, Ordering::Relaxed)
     }
@@ -92,7 +168,11 @@ impl TorrentStreams {
             }
         }
 
-        let mut all: Vec<_> = self.streams.iter().map(|s| s.queue(lengths)).collect();
+        let mut all: Vec<_> = self
+            .streams
+            .iter()
+            .map(|s| s.queue(lengths, self.lookahead))
+            .collect();
 
         // Shuffle to decrease determinism and make queueing fairer.
         use rand::seq::SliceRandom;
@@ -323,6 +403,14 @@ impl ManagedTorrent {
         true
     }
 
+    fn wake_piece_requesters(&self) {
+        self.with_state(|s| {
+            if let crate::ManagedTorrentState::Live(l) = s {
+                l.wake_piece_requesters();
+            }
+        });
+    }
+
     fn is_file_finished(&self, file_id: usize) -> bool {
         let metadata = self.metadata.load();
         let metadata = match metadata.as_ref() {
@@ -362,6 +450,7 @@ impl ManagedTorrent {
             metadata,
         };
         s.torrent.maybe_reconnect_needed_peers_for_file(file_id);
+        let windowed = streams.window.is_some();
         streams.streams.insert(
             s.stream_id,
             StreamState {
@@ -372,6 +461,10 @@ impl ManagedTorrent {
                 file_abs_offset: fd_offset,
             },
         );
+
+        if windowed {
+            s.torrent.wake_piece_requesters();
+        }
 
         debug!(stream_id = s.stream_id, file_id, "started stream");
 
@@ -389,6 +482,13 @@ impl FileStream {
     }
 
     fn set_position(&mut self, new_pos: u64) {
+        if self.streams.window.is_some() {
+            let dpl = self.metadata.lengths().default_piece_length() as u64;
+            let abs = self.file_torrent_abs_offset;
+            if (abs + self.position) / dpl != (abs + new_pos) / dpl {
+                self.torrent.wake_piece_requesters();
+            }
+        }
         self.position = new_pos;
         self.streams
             .streams
@@ -400,5 +500,83 @@ impl FileStream {
 
     pub fn len(&self) -> u64 {
         self.file_len
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::single_range_in_vec_init)]
+mod tests {
+    use librqbit_core::lengths::{Lengths, ValidPieceIndex};
+
+    use super::pieces_to_forget;
+
+    const PIECE: u32 = 16384;
+
+    fn setup() -> (Lengths, Vec<ValidPieceIndex>) {
+        let l = Lengths::new(PIECE as u64 * 10, PIECE).unwrap();
+        let all = (0..10)
+            .map(|i| l.validate_piece_index(i).unwrap())
+            .collect();
+        (l, all)
+    }
+
+    fn ids(pieces: Vec<ValidPieceIndex>) -> Vec<u32> {
+        pieces.into_iter().map(|p| p.get()).collect()
+    }
+
+    #[test]
+    fn nothing_is_forgotten_within_budget_or_without_streams() {
+        let (l, all) = setup();
+        let held = PIECE as u64 * 10;
+        assert!(pieces_to_forget(all.iter().copied(), &l, &[0..1], held, held).is_empty());
+        assert!(pieces_to_forget(all.iter().copied(), &l, &[], held, 0).is_empty());
+    }
+
+    #[test]
+    fn the_farthest_pieces_go_first_and_spans_are_kept() {
+        let (l, all) = setup();
+        let p = PIECE as u64;
+        let span = 4 * p + 10..7 * p;
+        let forget = pieces_to_forget(
+            all.iter().copied(),
+            &l,
+            std::slice::from_ref(&span),
+            10 * p,
+            6 * p,
+        );
+        assert_eq!(ids(forget), vec![0, 1, 9, 2]);
+        let forget = pieces_to_forget(all.iter().copied(), &l, &[span], 10 * p, 0);
+        assert_eq!(ids(forget), vec![0, 1, 9, 2, 8, 3, 7]);
+    }
+
+    #[test]
+    fn a_piece_near_any_stream_is_near() {
+        let (l, all) = setup();
+        let p = PIECE as u64;
+        let forget = pieces_to_forget(
+            all.iter().copied(),
+            &l,
+            &[0..p, 9 * p..10 * p],
+            10 * p,
+            8 * p,
+        );
+        assert_eq!(ids(forget), vec![5, 4]);
+    }
+
+    #[test]
+    fn a_stream_at_the_end_keeps_the_last_piece() {
+        let (l, all) = setup();
+        let p = PIECE as u64;
+        let forget = pieces_to_forget(all.iter().copied(), &l, &[10 * p..10 * p], 10 * p, 0);
+        assert_eq!(
+            forget.len(),
+            10,
+            "an empty span at EOF protects nothing past it"
+        );
+        let forget = pieces_to_forget(all.iter().copied(), &l, &[9 * p + 1..9 * p + 1], 10 * p, 0);
+        assert!(
+            !ids(forget).contains(&9),
+            "the piece the stream is in stays"
+        );
     }
 }

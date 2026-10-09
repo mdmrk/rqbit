@@ -723,6 +723,53 @@ impl TorrentStateLive {
             .map(|c| *c.get_hns())
     }
 
+    pub(crate) fn wake_piece_requesters(&self) {
+        self.new_pieces_notify.notify_waiters();
+    }
+
+    fn forget_pieces_outside_window(&self) -> anyhow::Result<()> {
+        let Some(budget) = self.streams.window() else {
+            return Ok(());
+        };
+        let forgotten = {
+            let mut g = self.lock_write("forget_pieces_outside_window");
+            let pieces = g.get_pieces_mut()?;
+            let chunks = pieces.chunks();
+            let lengths = self.metadata.lengths();
+            let forget = super::streaming::pieces_to_forget(
+                chunks
+                    .get_have_pieces()
+                    .as_slice()
+                    .iter_ones()
+                    .filter_map(|i| lengths.validate_piece_index(i.try_into().ok()?)),
+                lengths,
+                &self.streams.spans(),
+                chunks.get_hns().have_bytes,
+                budget,
+            );
+            let mut forgotten = Vec::with_capacity(forget.len());
+            for piece in forget {
+                if pieces.forget_piece(piece, &self.metadata.file_infos) {
+                    self.stats
+                        .have_bytes
+                        .fetch_sub(lengths.piece_length(piece) as u64, Ordering::Relaxed);
+                    forgotten.push(piece);
+                }
+            }
+            forgotten
+        };
+        for piece in forgotten {
+            trace!(
+                piece = piece.get(),
+                "forgot piece outside the stream window"
+            );
+            if let Err(e) = self.files.discard_piece(piece) {
+                debug!(?piece, "file storage errored in discard_piece(): {e:#}");
+            }
+        }
+        Ok(())
+    }
+
     fn transmit_haves(&self, index: ValidPieceIndex) {
         let _ = self.have_broadcast_tx.send(index);
     }
@@ -855,6 +902,8 @@ impl TorrentStateLive {
         let locked = &mut **g;
         let pieces = locked.get_pieces_mut()?;
 
+        let still_have = pieces.chunks().is_piece_have(id);
+
         // if we have all the pieces of the file, reopen it read only
         for (idx, file_info) in self
             .metadata
@@ -863,12 +912,20 @@ impl TorrentStateLive {
             .enumerate()
             .skip_while(|(_, fi)| !fi.piece_range.contains(&id.get()))
             .take_while(|(_, fi)| fi.piece_range.contains(&id.get()))
+            .filter(|_| still_have)
         {
             let _remaining = pieces.update_file_have_on_piece_completed(id, idx, file_info);
         }
 
         self.streams
             .wake_streams_on_piece_completed(id, self.metadata.lengths());
+
+        if self.streams.window().is_some() {
+            drop(g);
+            self.forget_pieces_outside_window()?;
+            g = self.lock_write("on_piece_completed");
+        }
+        let locked = &mut **g;
 
         locked.unflushed_bitv_bytes += self.metadata.lengths().piece_length(id) as u64;
         if locked.unflushed_bitv_bytes >= FLUSH_BITV_EVERY_BYTES {
@@ -1458,6 +1515,7 @@ impl PeerHandler {
                             .try_write()
                             .is_some()
                     },
+                    only_priority: self.state.streams.window().is_some(),
                 });
 
                 match result {
@@ -1524,6 +1582,10 @@ impl PeerHandler {
             .get_chunks()?
             .is_chunk_ready_to_upload(&chunk_info)
         {
+            if self.state.streams.window().is_some() {
+                debug!(?chunk_info, "ignoring a request for a forgotten piece");
+                return Ok(());
+            }
             anyhow::bail!(
                 "got request for a chunk that is not ready to upload. chunk {:?}",
                 chunk_info
