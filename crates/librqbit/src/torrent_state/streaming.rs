@@ -134,9 +134,6 @@ impl TorrentStreams {
         self.lookahead.load(Ordering::Relaxed)
     }
 
-    // Sets how far ahead of each stream pieces are queued, capped at the
-    // default; 0 queues nothing, None restores the default. Returns whether
-    // it changed.
     pub(crate) fn set_lookahead(&self, bytes: Option<u64>) -> bool {
         let value = bytes.map_or(self.default_lookahead, |b| b.min(self.default_lookahead));
         self.lookahead.swap(value, Ordering::Relaxed) != value
@@ -422,11 +419,6 @@ impl ManagedTorrent {
         true
     }
 
-    /// Sets how many bytes ahead of each stream's position pieces are
-    /// downloaded, capped at the default for this torrent (three quarters of
-    /// the stream window, or 32 MiB without one). `Some(0)` downloads
-    /// nothing for streams, not even the piece a stream waits for. `None`
-    /// restores the default.
     pub fn set_stream_lookahead(&self, bytes: Option<u64>) -> anyhow::Result<()> {
         if self.streams()?.set_lookahead(bytes) {
             self.wake_piece_requesters();

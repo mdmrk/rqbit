@@ -259,7 +259,6 @@ impl PieceTracker {
         // Update ownership (piece stays in inflight, just changes owner)
         let info = self.inflight.get_mut(&piece)?;
         info.peer = req.peer;
-        info.helpers.retain(|h| *h != req.peer);
         info.started = Instant::now();
 
         Some(AcquireResult::Stolen {
