@@ -3,7 +3,7 @@ use std::{
     io::SeekFrom,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     task::{Poll, Waker},
     time::Instant,
@@ -62,7 +62,8 @@ impl StreamState {
 pub(crate) struct TorrentStreams {
     next_stream_id: AtomicUsize,
     streams: DashMap<StreamId, StreamState>,
-    lookahead: u64,
+    lookahead: AtomicU64,
+    default_lookahead: u64,
     window: Option<u64>,
 }
 
@@ -115,12 +116,27 @@ pub(crate) fn pieces_to_forget(
 
 impl TorrentStreams {
     pub(crate) fn new(window: Option<u64>) -> Self {
+        let default_lookahead = window.map_or(PER_STREAM_BUF_DEFAULT, |w| w / 4 * 3);
         Self {
             next_stream_id: AtomicUsize::new(0),
             streams: DashMap::new(),
-            lookahead: window.map_or(PER_STREAM_BUF_DEFAULT, |w| w / 4 * 3),
+            lookahead: AtomicU64::new(default_lookahead),
+            default_lookahead,
             window,
         }
+    }
+
+    fn lookahead(&self) -> u64 {
+        self.lookahead.load(Ordering::Relaxed)
+    }
+
+    // Sets how far ahead of each stream pieces are queued, capped at the
+    // default; None restores the default. Returns whether it changed.
+    pub(crate) fn set_lookahead(&self, bytes: Option<u64>) -> bool {
+        let value = bytes.map_or(self.default_lookahead, |b| {
+            b.clamp(1, self.default_lookahead.max(1))
+        });
+        self.lookahead.swap(value, Ordering::Relaxed) != value
     }
 
     pub(crate) fn window(&self) -> Option<u64> {
@@ -130,7 +146,7 @@ impl TorrentStreams {
     pub(crate) fn spans(&self) -> Vec<std::ops::Range<u64>> {
         self.streams
             .iter()
-            .map(|s| s.value().span(self.lookahead))
+            .map(|s| s.value().span(self.lookahead()))
             .collect()
     }
 
@@ -171,7 +187,7 @@ impl TorrentStreams {
         let mut all: Vec<_> = self
             .streams
             .iter()
-            .map(|s| s.queue(lengths, self.lookahead))
+            .map(|s| s.queue(lengths, self.lookahead()))
             .collect();
 
         // Shuffle to decrease determinism and make queueing fairer.
@@ -403,6 +419,17 @@ impl ManagedTorrent {
         true
     }
 
+    /// Sets how many bytes ahead of each stream's position pieces are
+    /// downloaded, capped at the default for this torrent (three quarters of
+    /// the stream window, or 32 MiB without one). `None` restores the
+    /// default.
+    pub fn set_stream_lookahead(&self, bytes: Option<u64>) -> anyhow::Result<()> {
+        if self.streams()?.set_lookahead(bytes) {
+            self.wake_piece_requesters();
+        }
+        Ok(())
+    }
+
     fn wake_piece_requesters(&self) {
         self.with_state(|s| {
             if let crate::ManagedTorrentState::Live(l) = s {
@@ -508,7 +535,7 @@ impl FileStream {
 mod tests {
     use librqbit_core::lengths::{Lengths, ValidPieceIndex};
 
-    use super::pieces_to_forget;
+    use super::{TorrentStreams, pieces_to_forget};
 
     const PIECE: u32 = 16384;
 
@@ -522,6 +549,21 @@ mod tests {
 
     fn ids(pieces: Vec<ValidPieceIndex>) -> Vec<u32> {
         pieces.into_iter().map(|p| p.get()).collect()
+    }
+
+    #[test]
+    fn the_lookahead_can_shrink_but_not_grow_past_the_default() {
+        let streams = TorrentStreams::new(Some(1000));
+        assert_eq!(streams.lookahead(), 750);
+        assert!(streams.set_lookahead(Some(100)));
+        assert!(!streams.set_lookahead(Some(100)));
+        assert_eq!(streams.lookahead(), 100);
+        streams.set_lookahead(Some(5000));
+        assert_eq!(streams.lookahead(), 750);
+        streams.set_lookahead(Some(0));
+        assert_eq!(streams.lookahead(), 1);
+        streams.set_lookahead(None);
+        assert_eq!(streams.lookahead(), 750);
     }
 
     #[test]
