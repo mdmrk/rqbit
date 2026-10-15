@@ -245,7 +245,7 @@ impl PieceTracker {
         let (piece, old_peer, _) = self
             .inflight
             .iter()
-            .filter(|(_, info)| info.peer != req.peer)
+            .filter(|(_, info)| !info.is_downloaded_by(req.peer))
             .filter(|(p, _)| (req.peer_has_piece)(**p))
             .map(|(p, info)| (*p, info.peer, info.started.elapsed()))
             .filter(|(_, _, elapsed)| *elapsed >= min_elapsed)
@@ -976,6 +976,29 @@ mod tests {
                 .is_empty(),
             "pieces past the urgent ones get no helpers"
         );
+    }
+
+    #[test]
+    fn a_helper_never_steals_the_piece_it_is_helping_with() {
+        let file_infos = make_test_file_infos(20);
+        let mut tracker = PieceTracker::new(make_test_chunk_tracker(20));
+        acquire(&mut tracker, peer(1), &[0], &file_infos);
+        acquire(&mut tracker, peer(2), &[0], &file_infos);
+        let file_priorities = make_default_file_priorities(&file_infos);
+        let result = tracker.acquire_piece(AcquireRequest {
+            peer: peer(2),
+            peer_avg_time: Some(Duration::ZERO),
+            priority_pieces: [index(0)].into_iter(),
+            file_priorities: &file_priorities,
+            file_infos: &file_infos,
+            peer_has_piece: |_| true,
+            can_steal: |_| true,
+            only_priority: true,
+        });
+        assert!(matches!(result, AcquireResult::NoneAvailable), "{result:?}");
+        let info = tracker.get_inflight(index(0)).unwrap();
+        assert_eq!(info.peer, peer(1));
+        assert!(info.is_downloaded_by(peer(2)));
     }
 
     #[test]
