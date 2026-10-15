@@ -54,7 +54,11 @@ impl StreamState {
         let std::ops::Range { start, end } = self.span(lookahead);
         let dpl = lengths.default_piece_length();
         let start_id = (start / dpl as u64).try_into().unwrap();
-        let end_id = end.div_ceil(dpl as u64).try_into().unwrap();
+        let end_id = if lookahead == 0 {
+            start_id
+        } else {
+            end.div_ceil(dpl as u64).try_into().unwrap()
+        };
         (start_id..end_id).filter_map(|i| lengths.validate_piece_index(i))
     }
 }
@@ -131,11 +135,10 @@ impl TorrentStreams {
     }
 
     // Sets how far ahead of each stream pieces are queued, capped at the
-    // default; None restores the default. Returns whether it changed.
+    // default; 0 queues nothing, None restores the default. Returns whether
+    // it changed.
     pub(crate) fn set_lookahead(&self, bytes: Option<u64>) -> bool {
-        let value = bytes.map_or(self.default_lookahead, |b| {
-            b.clamp(1, self.default_lookahead.max(1))
-        });
+        let value = bytes.map_or(self.default_lookahead, |b| b.min(self.default_lookahead));
         self.lookahead.swap(value, Ordering::Relaxed) != value
     }
 
@@ -421,8 +424,9 @@ impl ManagedTorrent {
 
     /// Sets how many bytes ahead of each stream's position pieces are
     /// downloaded, capped at the default for this torrent (three quarters of
-    /// the stream window, or 32 MiB without one). `None` restores the
-    /// default.
+    /// the stream window, or 32 MiB without one). `Some(0)` downloads
+    /// nothing for streams, not even the piece a stream waits for. `None`
+    /// restores the default.
     pub fn set_stream_lookahead(&self, bytes: Option<u64>) -> anyhow::Result<()> {
         if self.streams()?.set_lookahead(bytes) {
             self.wake_piece_requesters();
@@ -535,7 +539,7 @@ impl FileStream {
 mod tests {
     use librqbit_core::lengths::{Lengths, ValidPieceIndex};
 
-    use super::{TorrentStreams, pieces_to_forget};
+    use super::{StreamState, TorrentStreams, pieces_to_forget};
 
     const PIECE: u32 = 16384;
 
@@ -561,9 +565,24 @@ mod tests {
         streams.set_lookahead(Some(5000));
         assert_eq!(streams.lookahead(), 750);
         streams.set_lookahead(Some(0));
-        assert_eq!(streams.lookahead(), 1);
+        assert_eq!(streams.lookahead(), 0);
         streams.set_lookahead(None);
         assert_eq!(streams.lookahead(), 750);
+    }
+
+    #[test]
+    fn a_zero_lookahead_queues_nothing_not_even_the_current_piece() {
+        let (l, _) = setup();
+        let stream = StreamState {
+            file_id: 0,
+            file_len: PIECE as u64 * 10,
+            file_abs_offset: 0,
+            position: PIECE as u64 * 3 + 10,
+            waker: None,
+        };
+        assert_eq!(stream.queue(&l, 0).count(), 0);
+        let one: Vec<u32> = stream.queue(&l, 1).map(|p| p.get()).collect();
+        assert_eq!(one, vec![3]);
     }
 
     #[test]
