@@ -91,7 +91,7 @@ use crate::{
     peer_connection::{
         PeerConnection, PeerConnectionHandler, PeerConnectionOptions, WriterRequest,
     },
-    piece_tracker::{AcquireRequest, AcquireResult, PieceTracker},
+    piece_tracker::{AcquireRequest, AcquireResult, PieceTracker, chunk_request_order},
     session::CheckedIncomingConnection,
     session_stats::SessionStats,
     stream_connect::ConnectionKind,
@@ -1480,7 +1480,7 @@ impl PeerHandler {
     /// Acquire a piece for this peer: try steal (10x) → reserve → steal (3x).
     ///
     /// Returns the piece index to download, or None if no pieces are available.
-    fn acquire_next_piece(&self) -> crate::Result<Option<ValidPieceIndex>> {
+    fn acquire_next_piece(&self) -> crate::Result<Option<(ValidPieceIndex, bool)>> {
         if self.is_choked() {
             debug!("we are choked, can't acquire piece");
             return Ok(None);
@@ -1521,17 +1521,17 @@ impl PeerHandler {
                 match result {
                     AcquireResult::Reserved(piece) => {
                         trace!("reserved piece {}", piece);
-                        Ok(Some(piece))
+                        Ok(Some((piece, false)))
                     }
                     AcquireResult::Stolen { piece, from_peer } => {
                         debug!("stole piece {} from {}", piece, from_peer);
                         // Store steal info to process after releasing peer lock to avoid deadlock
                         steal_info = Some((from_peer, piece));
-                        Ok(Some(piece))
+                        Ok(Some((piece, false)))
                     }
                     AcquireResult::Helping(piece) => {
                         debug!("helping with urgent piece {}", piece);
-                        Ok(Some(piece))
+                        Ok(Some((piece, true)))
                     }
                     AcquireResult::NoneAvailable => Ok(None),
                 }
@@ -1745,7 +1745,7 @@ impl PeerHandler {
 
             // Acquire a piece using the strategy: try steal (10x) → reserve → steal (3x).
             let new_piece_notify = self.state.new_pieces_notify.notified();
-            let next = match self.acquire_next_piece()? {
+            let (next, helping) = match self.acquire_next_piece()? {
                 Some(next) => next,
                 None => {
                     debug!("no pieces to request");
@@ -1763,7 +1763,7 @@ impl PeerHandler {
                 }
             };
 
-            for chunk in self.state.lengths.iter_chunk_infos(next) {
+            for chunk in chunk_request_order(&self.state.lengths, next, helping) {
                 let request = Request {
                     index: next.get(),
                     begin: chunk.offset,
@@ -1771,6 +1771,10 @@ impl PeerHandler {
                 };
 
                 aframe!(self.wait_for_request_slot()).await;
+
+                if self.is_chunk_downloaded(&chunk)? {
+                    continue;
+                }
 
                 self.state
                     .ratelimits
@@ -1785,6 +1789,10 @@ impl PeerHandler {
                 }
 
                 aframe!(self.wait_for_request_slot()).await;
+
+                if self.is_chunk_downloaded(&chunk)? {
+                    continue;
+                }
 
                 match self
                     .state
@@ -1822,6 +1830,14 @@ impl PeerHandler {
                 }
             }
         }
+    }
+
+    fn is_chunk_downloaded(&self, chunk: &ChunkInfo) -> crate::Result<bool> {
+        Ok(self
+            .state
+            .lock_read("is_chunk_downloaded")
+            .get_chunks()?
+            .is_chunk_downloaded(chunk))
     }
 
     fn on_i_am_choked(&self) {

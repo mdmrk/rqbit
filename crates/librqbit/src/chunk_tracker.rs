@@ -319,6 +319,12 @@ impl ChunkTracker {
             .unwrap_or(false)
     }
 
+    pub fn is_chunk_downloaded(&self, chunk: &ChunkInfo) -> bool {
+        self.chunk_status
+            .get(chunk.absolute_index as usize)
+            .is_some_and(|b| *b)
+    }
+
     pub fn get_remaining_bytes(&self) -> u64 {
         self.hns.needed_bytes
     }
@@ -737,6 +743,34 @@ mod tests {
             !ct.queue_pieces[0],
             "a piece we have is still queued, so a second peer will download it again"
         );
+    }
+
+    #[test]
+    fn test_a_chunk_counts_as_downloaded_once_it_arrived() {
+        let piece_len = CHUNK_SIZE * 2;
+        let l = Lengths::new(piece_len as u64 * 3, piece_len).unwrap();
+        let files = vec![FileInfo {
+            relative_filename: "0".into(),
+            offset_in_torrent: 0,
+            piece_range: 0..3,
+            len: piece_len as u64 * 3,
+            attrs: Default::default(),
+        }];
+        let bf_len = l.piece_bitfield_bytes();
+        let have = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
+        let mut selected = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
+        selected.get_mut(0..3).unwrap().fill(true);
+        let mut ct = ChunkTracker::new(have.into_dyn(), selected, l, &files).unwrap();
+        let p1 = l.validate_piece_index(1).unwrap();
+        let chunks: Vec<_> = l.iter_chunk_infos(p1).collect();
+        assert!(!chunks.iter().any(|c| ct.is_chunk_downloaded(c)));
+
+        ct.chunk_status.set(chunks[1].absolute_index as usize, true);
+        assert!(!ct.is_chunk_downloaded(&chunks[0]));
+        assert!(ct.is_chunk_downloaded(&chunks[1]));
+
+        ct.mark_piece_broken_if_not_have(p1);
+        assert!(!ct.is_chunk_downloaded(&chunks[1]));
     }
 
     #[test]

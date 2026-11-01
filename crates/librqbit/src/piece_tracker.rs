@@ -26,7 +26,7 @@ pub const MAX_HELPERS: usize = 2;
 pub const HELP_AFTER_MAX: Duration = Duration::from_secs(1);
 
 use buffers::ByteBuf;
-use librqbit_core::lengths::ValidPieceIndex;
+use librqbit_core::lengths::{ChunkInfo, Lengths, ValidPieceIndex};
 use peer_binary_protocol::Piece;
 
 use crate::{
@@ -50,6 +50,18 @@ impl InflightPiece {
     pub fn is_downloaded_by(&self, peer: PeerHandle) -> bool {
         self.peer == peer || self.helpers.contains(&peer)
     }
+}
+
+pub fn chunk_request_order(
+    lengths: &Lengths,
+    piece: ValidPieceIndex,
+    helping: bool,
+) -> Vec<ChunkInfo> {
+    let mut chunks: Vec<ChunkInfo> = lengths.iter_chunk_infos(piece).collect();
+    if helping {
+        chunks.reverse();
+    }
+    chunks
 }
 
 /// Result of attempting to acquire a piece.
@@ -878,6 +890,22 @@ mod tests {
             }
             _ => panic!("Expected Stolen, got {:?}", result),
         }
+    }
+
+    #[test]
+    fn a_helper_requests_the_chunks_from_the_end() {
+        let l = Lengths::new(16384 * 20, 16384 * 4).unwrap();
+        let piece = l.validate_piece_index(2).unwrap();
+        let owner: Vec<u32> = chunk_request_order(&l, piece, false)
+            .iter()
+            .map(|c| c.chunk_index)
+            .collect();
+        let helper: Vec<u32> = chunk_request_order(&l, piece, true)
+            .iter()
+            .map(|c| c.chunk_index)
+            .collect();
+        assert_eq!(owner, vec![0, 1, 2, 3]);
+        assert_eq!(helper, vec![3, 2, 1, 0]);
     }
 
     // Urgent stream pieces with helpers.
