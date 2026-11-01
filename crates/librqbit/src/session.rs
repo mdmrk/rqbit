@@ -471,6 +471,8 @@ pub struct SessionOptions {
     pub blocklist_url: Option<String>,
     pub allowlist_url: Option<String>,
 
+    pub http_proxy_url: Option<String>,
+
     // The list of tracker URLs to always use for each torrent.
     pub trackers: HashSet<url::Url>,
 
@@ -510,6 +512,7 @@ impl Default for SessionOptions {
             ratelimits: LimitsConfig::default(),
             blocklist_url: None,
             allowlist_url: None,
+            http_proxy_url: None,
             trackers: HashSet::new(),
             peer_limit: None,
             #[cfg(feature = "disable-upload")]
@@ -713,8 +716,9 @@ impl Session {
                 .client_name_and_version
                 .unwrap_or_else(|| crate::client_name_and_version().to_owned());
 
+            let http_proxy_url = proxy_url.or(opts.http_proxy_url.as_ref());
             let reqwest_client = {
-                let builder = if let Some(proxy_url) = proxy_url {
+                let builder = if let Some(proxy_url) = http_proxy_url {
                     let proxy = reqwest::Proxy::all(proxy_url)
                         .context("error creating socks5 proxy for HTTP")?;
                     reqwest::Client::builder().proxy(proxy)
