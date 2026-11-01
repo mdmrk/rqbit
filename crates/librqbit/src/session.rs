@@ -2,7 +2,7 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     io::Read,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
@@ -1606,6 +1606,7 @@ impl Session {
         } else {
             Some(futures::stream::iter(initial_peers))
         };
+        let session = Arc::downgrade(self);
         merge_two_optional_streams(
             merge_two_optional_streams(
                 merge_two_optional_streams(dht_rx, tracker_rx),
@@ -1613,6 +1614,23 @@ impl Session {
             ),
             lsd_rx,
         )
+        .map(|peers| -> PeerStream {
+            peers
+                .filter(move |addr| {
+                    let allowed = session
+                        .upgrade()
+                        .is_some_and(|session| session.allows_peer(addr.ip()));
+                    if !allowed {
+                        debug!(?addr, "dropped a peer address (by the blocklist)");
+                    }
+                    std::future::ready(allowed)
+                })
+                .boxed()
+        })
+    }
+
+    fn allows_peer(&self, ip: IpAddr) -> bool {
+        !self.blocklist.has(ip) && self.allowlist.as_ref().is_none_or(|l| l.has(ip))
     }
 
     async fn try_update_persistence_metadata(&self, handle: &ManagedTorrentHandle) {
