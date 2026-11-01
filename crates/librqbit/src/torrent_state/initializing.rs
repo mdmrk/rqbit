@@ -23,7 +23,9 @@ use crate::{
 
 const MAX_FASTRESUME_CHECKS: usize = 64;
 
-use super::{ManagedTorrentShared, TorrentMetadata, paused::TorrentStatePaused};
+use super::{
+    ManagedTorrentShared, TorrentMetadata, paused::TorrentStatePaused, streaming::TorrentStreams,
+};
 
 pub struct TorrentStateInitializing {
     pub(crate) files: FileStorage,
@@ -297,7 +299,7 @@ impl TorrentStateInitializing {
             metadata: self.metadata.clone(),
             files: self.files.take()?,
             chunk_tracker,
-            streams: Arc::new(Default::default()),
+            streams: Arc::new(TorrentStreams::new(self.shared.options.stream_window)),
         };
         Ok(paused)
     }
