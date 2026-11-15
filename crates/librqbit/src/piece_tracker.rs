@@ -330,6 +330,22 @@ impl PieceTracker {
         count
     }
 
+    /// Gives up an in-flight piece: it goes back to QUEUED. Returns the peers
+    /// that were downloading it, the owner first.
+    pub fn abandon_piece(&mut self, piece: ValidPieceIndex) -> Vec<PeerHandle> {
+        let Some(info) = self.inflight.remove(&piece) else {
+            return Vec::new();
+        };
+        self.chunks.mark_piece_broken_if_not_have(piece);
+        let mut peers = vec![info.peer];
+        peers.extend(info.helpers);
+        peers
+    }
+
+    pub fn inflight_pieces(&self) -> impl Iterator<Item = ValidPieceIndex> + '_ {
+        self.inflight.keys().copied()
+    }
+
     // === QUERIES ===
 
     /// Get the inflight info for a piece, if it's currently being downloaded.
@@ -1048,6 +1064,29 @@ mod tests {
                 .unwrap()
                 .is_downloaded_by(peer(3))
         );
+    }
+
+    #[test]
+    fn an_abandoned_piece_goes_back_to_the_queue_and_names_its_peers() {
+        let file_infos = make_test_file_infos(20);
+        let mut tracker = PieceTracker::new(make_test_chunk_tracker(20));
+        acquire(&mut tracker, peer(1), &[0], &file_infos);
+        acquire(&mut tracker, peer(2), &[0], &file_infos);
+        acquire(&mut tracker, peer(3), &[0, 1], &file_infos);
+        let mut inflight: Vec<u32> = tracker.inflight_pieces().map(|p| p.get()).collect();
+        inflight.sort_unstable();
+        assert_eq!(inflight, vec![0]);
+
+        assert!(tracker.abandon_piece(index(5)).is_empty(), "not in flight");
+        assert_eq!(
+            tracker.abandon_piece(index(0)),
+            vec![peer(1), peer(2), peer(3)]
+        );
+        assert!(tracker.get_inflight(index(0)).is_none());
+        assert!(matches!(
+            acquire(&mut tracker, peer(4), &[0], &file_infos),
+            AcquireResult::Reserved(p) if p == index(0)
+        ));
     }
 
     #[test]

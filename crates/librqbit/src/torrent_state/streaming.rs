@@ -69,6 +69,7 @@ pub(crate) struct TorrentStreams {
     lookahead: AtomicU64,
     default_lookahead: u64,
     window: Option<u64>,
+    moves: AtomicU64,
 }
 
 impl Default for TorrentStreams {
@@ -127,7 +128,28 @@ impl TorrentStreams {
             lookahead: AtomicU64::new(default_lookahead),
             default_lookahead,
             window,
+            moves: AtomicU64::new(0),
         }
+    }
+
+    pub(crate) fn moves(&self) -> u64 {
+        self.moves.load(Ordering::Relaxed)
+    }
+
+    fn moved(&self) {
+        self.moves.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn wants(&self, lengths: &Lengths, piece: ValidPieceIndex) -> bool {
+        let start = lengths.piece_offset(piece);
+        let end = start + lengths.piece_length(piece) as u64;
+        let lookahead = self.lookahead();
+        let mut streams = self.streams.iter().peekable();
+        streams.peek().is_none()
+            || streams.any(|s| {
+                let span = s.value().span(lookahead);
+                start < span.end && end > span.start
+            })
     }
 
     fn lookahead(&self) -> u64 {
@@ -218,7 +240,9 @@ impl TorrentStreams {
 
     fn drop_stream(&self, stream_id: StreamId) -> Option<StreamState> {
         debug!(stream_id, "dropping stream");
-        self.streams.remove(&stream_id).map(|s| s.1)
+        let dropped = self.streams.remove(&stream_id).map(|s| s.1);
+        self.moved();
+        dropped
     }
 
     pub(crate) fn streamed_file_ids(&self) -> impl Iterator<Item = usize> + '_ {
@@ -359,6 +383,8 @@ impl AsyncSeek for FileStream {
         }
 
         self.as_mut().set_position(map_io_err!(new_pos.try_into())?);
+        self.streams.moved();
+        self.torrent.abandon_unwanted_pieces();
         debug!(stream_id = self.stream_id, position = self.position, "seek");
         Ok(())
     }
@@ -434,6 +460,14 @@ impl ManagedTorrent {
         });
     }
 
+    fn abandon_unwanted_pieces(&self) {
+        self.with_state(|s| {
+            if let crate::ManagedTorrentState::Live(l) = s {
+                l.abandon_unwanted_pieces();
+            }
+        });
+    }
+
     fn is_file_finished(&self, file_id: usize) -> bool {
         let metadata = self.metadata.load();
         let metadata = match metadata.as_ref() {
@@ -485,6 +519,7 @@ impl ManagedTorrent {
             },
         );
 
+        streams.moved();
         if windowed {
             s.torrent.wake_piece_requesters();
         }
@@ -575,6 +610,42 @@ mod tests {
         assert_eq!(stream.queue(&l, 0).count(), 0);
         let one: Vec<u32> = stream.queue(&l, 1).map(|p| p.get()).collect();
         assert_eq!(one, vec![3]);
+    }
+
+    #[test]
+    fn a_piece_is_wanted_inside_a_stream_span_or_without_streams() {
+        let (l, all) = setup();
+        let p = PIECE as u64;
+        let streams = TorrentStreams::new(Some(4 * p));
+        assert!(streams.wants(&l, all[9]), "no stream to tell");
+        streams.streams.insert(
+            0,
+            StreamState {
+                file_id: 0,
+                file_len: 10 * p,
+                file_abs_offset: 0,
+                position: 4 * p + 10,
+                waker: None,
+            },
+        );
+        streams.set_lookahead(Some(2 * p));
+        let wanted: Vec<u32> = all
+            .iter()
+            .filter(|piece| streams.wants(&l, **piece))
+            .map(|piece| piece.get())
+            .collect();
+        assert_eq!(wanted, vec![4, 5, 6]);
+        streams.set_lookahead(Some(0));
+        assert!(streams.wants(&l, all[4]), "the piece the stream is in");
+        assert!(!streams.wants(&l, all[5]), "nothing is being filled");
+    }
+
+    #[test]
+    fn dropping_a_stream_counts_as_a_move() {
+        let streams = TorrentStreams::new(Some(1000));
+        let before = streams.moves();
+        streams.drop_stream(7);
+        assert_eq!(streams.moves(), before + 1);
     }
 
     #[test]

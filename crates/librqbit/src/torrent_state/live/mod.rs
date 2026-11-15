@@ -738,6 +738,37 @@ impl TorrentStateLive {
         self.new_pieces_notify.notify_waiters();
     }
 
+    pub(crate) fn abandon_unwanted_pieces(&self) {
+        if self.streams.window().is_none() {
+            return;
+        }
+        let abandoned: Vec<(ValidPieceIndex, Vec<PeerHandle>)> = {
+            let mut g = self.lock_write("abandon_unwanted_pieces");
+            let Ok(pieces) = g.get_pieces_mut() else {
+                return;
+            };
+            let unwanted: Vec<ValidPieceIndex> = pieces
+                .inflight_pieces()
+                .filter(|piece| !self.streams.wants(&self.lengths, *piece))
+                .collect();
+            unwanted
+                .into_iter()
+                .filter_map(|piece| {
+                    let _writing = self.per_piece_locks[piece.get_usize()].try_write()?;
+                    Some((piece, pieces.abandon_piece(piece)))
+                })
+                .collect()
+        };
+        for (piece, peers) in abandoned {
+            debug!(piece = piece.get(), "gave up a piece no stream wants");
+            for peer in peers {
+                self.peers.with_live_mut(peer, "abandon_piece", |live| {
+                    live.cancel_inflight_requests_for_piece(piece);
+                });
+            }
+        }
+    }
+
     fn forget_pieces_outside_window(&self) -> anyhow::Result<()> {
         let Some(budget) = self.streams.window() else {
             return Ok(());
@@ -1788,6 +1819,7 @@ impl PeerHandler {
                 }
             };
 
+            let mut moves = self.state.streams.moves();
             for chunk in chunk_request_order(&self.state.lengths, next, helping) {
                 let request = Request {
                     index: next.get(),
@@ -1796,6 +1828,15 @@ impl PeerHandler {
                 };
 
                 aframe!(self.wait_for_request_slot()).await;
+
+                let now = self.state.streams.moves();
+                if now != moves {
+                    moves = now;
+                    if !self.is_downloading(next)? {
+                        debug!("piece {} was given up after a stream moved", next);
+                        break;
+                    }
+                }
 
                 if self.is_chunk_downloaded(&chunk)? {
                     continue;
@@ -1855,6 +1896,15 @@ impl PeerHandler {
                 }
             }
         }
+    }
+
+    fn is_downloading(&self, piece: ValidPieceIndex) -> crate::Result<bool> {
+        Ok(self
+            .state
+            .lock_read("is_downloading")
+            .get_pieces()?
+            .get_inflight(piece)
+            .is_some_and(|inflight| inflight.is_downloaded_by(self.addr)))
     }
 
     fn is_chunk_downloaded(&self, chunk: &ChunkInfo) -> crate::Result<bool> {
