@@ -269,6 +269,10 @@ pub(crate) struct LivePeerState {
     // When the peer sends us data this is used to track if we asked for it.
     inflight_requests: HashSet<InflightRequest>,
 
+    // Chunks the peer asked for that wait in the upload queue. A "cancel"
+    // from the peer takes its chunk out, and the queue skips it.
+    pending_uploads: HashSet<ChunkInfo>,
+
     // Bounded tolerance for chunks that arrive after we cancel requests.
     // This is intentionally approximate: we track a count instead of storing every
     // canceled chunk, so a peer is not disconnected for racing our cancel messages.
@@ -296,6 +300,7 @@ impl LivePeerState {
             bitfield: BF::default(),
             seeder: false,
             inflight_requests: Default::default(),
+            pending_uploads: Default::default(),
             late_cancelled_request_tolerance: 0,
             request_slots_changed: Default::default(),
             tx,
@@ -313,6 +318,18 @@ impl LivePeerState {
 
     pub fn requested_inflight_count(&self) -> usize {
         self.inflight_requests.len()
+    }
+
+    pub fn add_upload(&mut self, chunk: ChunkInfo) {
+        self.pending_uploads.insert(chunk);
+    }
+
+    pub fn cancel_upload(&mut self, chunk: &ChunkInfo) {
+        self.pending_uploads.remove(chunk);
+    }
+
+    pub fn take_upload(&mut self, chunk: &ChunkInfo) -> bool {
+        self.pending_uploads.remove(chunk)
     }
 
     pub fn add_inflight_request(&mut self, chunk: ChunkInfo) -> bool {

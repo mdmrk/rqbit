@@ -210,6 +210,7 @@ pub struct TorrentStateLive {
     have_broadcast_tx: tokio::sync::broadcast::Sender<ValidPieceIndex>,
 
     ratelimit_upload_tx: tokio::sync::mpsc::UnboundedSender<(
+        PeerHandle,
         tokio::sync::mpsc::UnboundedSender<WriterRequest>,
         ChunkInfo,
     )>,
@@ -260,6 +261,7 @@ impl TorrentStateLive {
         let (have_broadcast_tx, _) = tokio::sync::broadcast::channel(128);
 
         let (ratelimit_upload_tx, ratelimit_upload_rx) = tokio::sync::mpsc::unbounded_channel::<(
+            PeerHandle,
             tokio::sync::mpsc::UnboundedSender<WriterRequest>,
             ChunkInfo,
         )>();
@@ -443,11 +445,20 @@ impl TorrentStateLive {
     async fn task_upload_scheduler(
         self: Arc<Self>,
         mut rx: tokio::sync::mpsc::UnboundedReceiver<(
+            PeerHandle,
             tokio::sync::mpsc::UnboundedSender<WriterRequest>,
             ChunkInfo,
         )>,
     ) -> crate::Result<()> {
-        while let Some((tx, ci)) = rx.recv().await {
+        while let Some((addr, tx, ci)) = rx.recv().await {
+            let wanted = self
+                .peers
+                .with_live_mut(addr, "take_upload", |live| live.take_upload(&ci))
+                .unwrap_or(false);
+            if !wanted {
+                trace!(?ci, "the peer cancelled this request or is gone");
+                continue;
+            }
             tokio::select! {
                 _ = tx.closed() => {
                     continue;
@@ -1146,8 +1157,25 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             Message::NotInterested => {
                 trace!("received \"not interested\", but we don't process it yet")
             }
-            Message::Cancel(_) => {
-                trace!("received \"cancel\", but we don't process it yet")
+            Message::Cancel(request) => {
+                if let Some(chunk) = self
+                    .state
+                    .lengths
+                    .validate_piece_index(request.index)
+                    .and_then(|piece| {
+                        self.state.lengths.chunk_info_from_received_data(
+                            piece,
+                            request.begin,
+                            request.length,
+                        )
+                    })
+                {
+                    self.state
+                        .peers
+                        .with_live_mut(self.addr, "cancel_upload", |live| {
+                            live.cancel_upload(&chunk)
+                        });
+                }
             }
             Message::Extended(ExtendedMessage::UtMetadata(UtMetadata::Request(
                 metadata_piece_id,
@@ -1587,8 +1615,11 @@ impl PeerHandler {
         }
 
         self.state
+            .peers
+            .with_live_mut(self.addr, "add_upload", |live| live.add_upload(chunk_info));
+        self.state
             .ratelimit_upload_tx
-            .send((self.tx.clone(), chunk_info))?;
+            .send((self.addr, self.tx.clone(), chunk_info))?;
         Ok(())
     }
 
