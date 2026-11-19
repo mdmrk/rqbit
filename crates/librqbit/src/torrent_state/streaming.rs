@@ -400,6 +400,7 @@ impl AsyncSeek for FileStream {
 impl Drop for FileStream {
     fn drop(&mut self) {
         self.streams.drop_stream(self.stream_id);
+        self.torrent.abandon_unwanted_pieces();
     }
 }
 
